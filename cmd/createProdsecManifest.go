@@ -21,6 +21,7 @@ import (
 type createProdsecManifestCmdFlags struct {
 	baseBranch     string
 	manifestScript string
+	typeOfManifest string
 }
 
 type createProdsecManifestCmd struct {
@@ -29,6 +30,7 @@ type createProdsecManifestCmd struct {
 	baseBranch      plumbing.ReferenceName
 	githubPRService services.PullRequestsService
 	manifestScript  string
+	typeOfManifest  string
 	gitUser         string
 	gitPass         string
 	gitCloneService services.GitCloneService
@@ -62,10 +64,12 @@ func init() {
 	releaseCmd.AddCommand(cmd)
 	cmd.Flags().StringVarP(&f.baseBranch, "branch", "b", "master", "Base branch of the manifest generation")
 	cmd.Flags().StringVar(&f.manifestScript, "manifestGenerationScript", "scripts/prodsec-manifest-generator.sh", "Relative path to the script to run before creating the PR")
+	cmd.Flags().StringVar(&f.typeOfManifest, "typeOfManifest", "production", "Type of manifest generator job - production, master or compare")
 }
 
 func newCreateProdsecManifestCmd(f *createProdsecManifestCmdFlags) (*createProdsecManifestCmd, error) {
 	var token string
+	var version *utils.RHMIVersion
 	var err error
 	if token, err = requireValue(GithubTokenKey); err != nil {
 		return nil, err
@@ -77,7 +81,13 @@ func newCreateProdsecManifestCmd(f *createProdsecManifestCmdFlags) (*createProds
 	client := newGithubClient(token)
 	repoInfo := &githubRepoInfo{owner: integreatlyGHOrg, repo: integreatlyOperatorRepo}
 	baseBranch := plumbing.NewBranchReferenceName(f.baseBranch)
-	version, err := utils.NewVersion(releaseVersion, olmType)
+
+	// as version param is required, setting a mock version for non-production manifest.
+	if f.typeOfManifest != "production" {
+		version, err = utils.NewVersion("5.0.0", olmType)
+	} else {
+		version, err = utils.NewVersion(releaseVersion, olmType)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +96,7 @@ func newCreateProdsecManifestCmd(f *createProdsecManifestCmdFlags) (*createProds
 		repoInfo:        repoInfo,
 		baseBranch:      baseBranch,
 		manifestScript:  f.manifestScript,
+		typeOfManifest:  f.typeOfManifest,
 		githubPRService: client.PullRequests,
 		gitUser:         user,
 		gitPass:         token,
@@ -95,13 +106,33 @@ func newCreateProdsecManifestCmd(f *createProdsecManifestCmdFlags) (*createProds
 }
 
 func (c *createProdsecManifestCmd) run(ctx context.Context) (string, error) {
+	var manifestBranchName string
+	var branchToCreateManifestFrom string
+	var manifestFileName string
+
+	switch c.typeOfManifest {
+	case "production":
+		manifestBranchName = c.version.PrepareProdsecManifestBranchName()
+		branchToCreateManifestFrom = c.version.ReleaseBranchName()
+		manifestFileName = fmt.Sprintf("%s-production-release-manifest.txt", c.version.NameByOlmType())
+	case "master":
+		date := time.Now()
+		manifestBranchName = fmt.Sprintf("%s-master-manifest-update-%s", c.version.OlmType(), date.Format("2006-01-02"))
+		manifestFileName = fmt.Sprintf("%s-master-manifest.txt", c.version.NameByOlmType())
+		branchToCreateManifestFrom = "master"
+	case "compare":
+		branchToCreateManifestFrom = "master"
+	default:
+		manifestBranchName = c.version.PrepareProdsecManifestBranchName()
+		branchToCreateManifestFrom = c.version.ReleaseBranchName()
+	}
+
 	// Clone the repo
 	fmt.Println(fmt.Sprintf("Clone repo from %s/%s/%s.git to a temporary directory", githubURL, c.repoInfo.owner, c.repoInfo.repo))
 	repoDir, gitRepo, err := c.gitCloneService.CloneToTmpDir("integreatly-operator", fmt.Sprintf("%s/%s/%s.git", githubURL, c.repoInfo.owner, c.repoInfo.repo), c.baseBranch)
 	if err != nil {
 		return "", err
 	}
-
 	fmt.Println("Repo cloned to", repoDir)
 	gitRepoTree, err := gitRepo.Worktree()
 	if err != nil {
@@ -109,9 +140,8 @@ func (c *createProdsecManifestCmd) run(ctx context.Context) (string, error) {
 	}
 
 	// Checking out the OLM_TYPE-release-VERSION branch as the manifest generation script must be run from this branch
-	releasedBranchName := c.version.ReleaseBranchName()
-	fmt.Println(fmt.Sprintf("Checkout branch %s", releasedBranchName))
-	if err = checkoutBranch(gitRepoTree, false, false, releasedBranchName); err != nil {
+	fmt.Println(fmt.Sprintf("Checkout branch %s", branchToCreateManifestFrom))
+	if err = checkoutBranch(gitRepoTree, false, false, branchToCreateManifestFrom); err != nil {
 		return "", err
 	}
 
@@ -120,8 +150,10 @@ func (c *createProdsecManifestCmd) run(ctx context.Context) (string, error) {
 	if err = c.runManifestScript(repoDir); err != nil {
 		return "", err
 	}
+	if err == nil && c.typeOfManifest == "compare" {
+		return fmt.Sprintf("Master manifest for %s up to date", c.version.OlmType()), nil
+	}
 
-	manifestFileName := fmt.Sprintf("%s-production-release-manifest.txt", c.version.NameByOlmType())
 	manifestPath := fmt.Sprintf("%s/prodsec-manifests/%s", repoDir, manifestFileName)
 	temporaryManifestPath := fmt.Sprintf("%s/../temporary-manifest.txt", repoDir)
 
@@ -136,10 +168,9 @@ func (c *createProdsecManifestCmd) run(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	// Preparing new branch called OLM_TYPE-manifest-for-release-OLM_TYPE-VERSION of release
-	manifestReleaseBranchName := c.version.PrepareProdsecManifestBranchName()
-	fmt.Println(fmt.Sprintf("Create new branch %s", manifestReleaseBranchName))
-	if err = checkoutBranch(gitRepoTree, true, true, manifestReleaseBranchName); err != nil {
+	fmt.Println(fmt.Sprintf("Create new branch %s", manifestBranchName))
+
+	if err = checkoutBranch(gitRepoTree, true, true, manifestBranchName); err != nil {
 		return "", err
 	}
 
@@ -161,7 +192,7 @@ func (c *createProdsecManifestCmd) run(ctx context.Context) (string, error) {
 		return repoDir, nil
 	}
 
-	if err = c.createPRIfNotExists(ctx, manifestReleaseBranchName); err != nil {
+	if err = c.createPRIfNotExists(ctx, manifestBranchName); err != nil {
 		return "", err
 	}
 
@@ -172,9 +203,7 @@ func (c *createProdsecManifestCmd) runManifestScript(repoDir string) error {
 	if err := os.Chmod(path.Join(repoDir, c.manifestScript), 0755); err != nil {
 		return err
 	}
-
-	envs := []string{fmt.Sprintf("OLM_TYPE=%s", c.version.OlmType()), "TYPE_OF_MANIFEST=production", fmt.Sprintf("PATH=%s", os.Getenv("PATH")), "HOME=/tmp"}
-
+	envs := []string{fmt.Sprintf("OLM_TYPE=%s", c.version.OlmType()), fmt.Sprintf("TYPE_OF_MANIFEST=%s", c.typeOfManifest), fmt.Sprintf("PATH=%s", os.Getenv("PATH")), fmt.Sprintf("HOME=%s", os.Getenv("HOME"))}
 	manifestGeneratorScript := &exec.Cmd{Dir: repoDir, Env: envs, Path: c.manifestScript, Stdout: os.Stdout, Stderr: os.Stderr}
 	return manifestGeneratorScript.Run()
 }
@@ -184,7 +213,7 @@ func (c *createProdsecManifestCmd) commitAndPushChanges(gitRepo *git.Repository,
 	if err := gitRepoTree.AddGlob("."); err != nil {
 		return err
 	}
-	if _, err := gitRepoTree.Commit(fmt.Sprintf("Prepare %s manifest for version %s", c.version.OlmType(), c.version.TagName()), &git.CommitOptions{
+	if _, err := gitRepoTree.Commit(fmt.Sprintf("Prepare %s manifest for %s", c.version.OlmType(), c.typeOfManifest), &git.CommitOptions{
 		Author: &object.Signature{
 			Name:  commitAuthorName,
 			Email: commitAuthorEmail,
@@ -214,8 +243,7 @@ func (c *createProdsecManifestCmd) createPRIfNotExists(ctx context.Context, rele
 		return err
 	}
 	if pr == nil {
-		fmt.Printf("Create PR for %s manifest version - %s", c.version.OlmType(), c.version.TagName())
-		t := fmt.Sprintf("Manifest PR for version %s", c.version.TagName())
+		t := fmt.Sprintf("Manifest PR for %s for %s manifest", c.version.OlmType(), c.typeOfManifest)
 		b := c.baseBranch.String()
 		req := &github.NewPullRequest{
 			Title: &t,
